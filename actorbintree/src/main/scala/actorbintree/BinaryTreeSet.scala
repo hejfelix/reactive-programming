@@ -52,7 +52,7 @@ object BinaryTreeSet {
 
 }
 
-class BinaryTreeSet extends Actor {
+class BinaryTreeSet extends Actor with ActorLogging {
   import BinaryTreeSet._
   import BinaryTreeNode._
 
@@ -70,7 +70,11 @@ class BinaryTreeSet extends Actor {
   // optional
   /** Accepts `Operation` and `GC` messages. */
   val normal: Receive = {
-    case GC  => context.become(garbageCollecting(createRoot))
+    case GC =>
+      log.debug(s"Starting garbage collection: ${self}")
+      val newRoot = createRoot
+      context.become(garbageCollecting(newRoot))
+      root ! CopyTo(newRoot)
     case msg => root ! msg
   }
 
@@ -81,10 +85,20 @@ class BinaryTreeSet extends Actor {
     */
   def garbageCollecting(newRoot: ActorRef): Receive = {
     case CopyFinished =>
+      log.debug(s"Garbage collectioN: copy finished")
       root = newRoot
       context.become(normal)
-    case GC  =>
-    case msg => newRoot ! msg
+      log.debug(s"CopyFinished, emptying queue: ${pendingQueue}")
+      while (pendingQueue.nonEmpty) {
+        val (msg, remaining) = pendingQueue.dequeue
+        println(s"Finishing ${msg}")
+        newRoot ! msg
+        pendingQueue = remaining
+      }
+    case GC             =>
+    case msg: Operation =>
+//      log.debug(s"Queuing message: ${msg}")
+      pendingQueue = pendingQueue enqueue msg
   }
 
 }
@@ -102,7 +116,9 @@ object BinaryTreeNode {
     Props(classOf[BinaryTreeNode], elem, initiallyRemoved)
 }
 
-class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
+class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean)
+    extends Actor
+    with ActorLogging {
   import BinaryTreeNode._
   import BinaryTreeSet._
 
@@ -167,19 +183,28 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
         sender ! ContainsResult(id, result = false)
       }
     case msg @ CopyTo(treeNode) =>
+      val insertConfirmed = removed
+      log.debug(
+        s"Beginning copy to ${treeNode} from ${self}...removed: ${removed}, confirmed: ${insertConfirmed}"
+      )
       val insertId = Random.nextInt
       if (!removed)
         treeNode ! Insert(self, insertId, this.elem)
       val children: Set[ActorRef] = List(left, right).flatten.toSet
       children.foreach(_ ! msg)
-      context.become(
-        copying(
-          children,
-          insertConfirmed = false,
-          insertId = insertId,
-          sender()
+
+      if (removed && children.isEmpty) {
+        sender() ! CopyFinished
+      } else {
+        context.become(
+          copying(
+            children,
+            insertConfirmed = insertConfirmed,
+            insertId = insertId,
+            sender()
+          )
         )
-      )
+      }
   }
 
   // optional
@@ -190,7 +215,17 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
               insertConfirmed: Boolean,
               insertId: Int,
               requester: ActorRef): Receive = {
+    case CopyFinished
+        if expected.size == 1 && expected.contains(sender) && insertConfirmed =>
+      log.debug(s"Finished copying, eating pill...replying to ${requester}")
+      requester ! CopyFinished
+      self ! PoisonPill
+    case OperationFinished(`insertId`) if expected.isEmpty =>
+      log.debug(s"Finished copying, eating pill...replying to ${requester}")
+      requester ! CopyFinished
+      self ! PoisonPill
     case OperationFinished(`insertId`) =>
+      log.debug(s"Operation finished: ${insertId}, still expecting: ${expected}")
       context.become(
         copying(
           expected,
@@ -199,11 +234,10 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
           requester
         )
       )
-    case CopyFinished
-        if expected.size == 1 && expected.contains(sender) && insertConfirmed =>
-      requester ! CopyFinished
-      self ! PoisonPill
     case CopyFinished =>
+      log.debug(
+        s"${sender()} finished copying.., ${expected}, ${insertConfirmed}"
+      )
       context.become(
         copying(expected - sender(), insertConfirmed, insertId, requester)
       )
